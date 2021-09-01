@@ -1,7 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use miniaudio::{Context, Device, DeviceConfig, DeviceType, Format};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    Device, SampleRate, StreamConfig,
+};
 
 use crate::error::Error;
 
@@ -40,22 +43,26 @@ impl AudioOutputRemote {
 }
 
 pub struct AudioOutput {
-    context: Context,
+    device: Device,
     event_sender: Sender<InternalEvent>,
     event_receiver: Receiver<InternalEvent>,
 }
 
 impl AudioOutput {
     pub fn open() -> Result<Self, Error> {
-        let backends = &[]; // Use default backend order.
-        let config = None; // Use default context config.
-        let context = Context::new(backends, config)?;
+        let device = cpal::default_host()
+            .default_output_device()
+            .ok_or_else(|| {
+                Error::AudioOutputError(Box::new(CPalError(
+                    "Failed to obtain default audio output device".into(),
+                )))
+            })?;
 
         // Channel used for controlling the audio output.
         let (event_sender, event_receiver) = unbounded();
 
         Ok(Self {
-            context,
+            device,
             event_sender,
             event_receiver,
         })
@@ -72,68 +79,68 @@ impl AudioOutput {
         T: AudioSource + Send + 'static,
     {
         // Create a device config that describes the kind of device we want to use.
-        let mut config = DeviceConfig::new(DeviceType::Playback);
+        let config;
 
         {
             // Setup the device config for playback with the channel count and sample rate
             // from the audio source.
             let source = source.lock().expect("Failed to acquire audio source lock");
-            config.playback_mut().set_format(Format::F32);
-            config.playback_mut().set_channels(source.channels().into());
-            config.set_sample_rate(source.sample_rate());
+            let default_config: StreamConfig = self.device.default_output_config()?.into();
+            config = StreamConfig {
+                channels: source.channels().into(),
+                sample_rate: SampleRate(source.sample_rate()),
+                buffer_size: default_config.buffer_size,
+            };
+        }
+
+        let volume = Arc::new(Mutex::new(1.0f32));
+        let channels = config.channels;
+        // Move the source and a clone of the volume into the data callback.
+        let stream = {
+            let volume = volume.clone();
+            self.device.build_output_stream(
+                &config,
+                move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let mut source = source.lock().expect("Failed to acquire audio source lock");
+                    // Get the audio normalization factor.
+                    let norm_factor = source.normalization_factor().unwrap_or(1.0);
+                    let volume = *volume.lock().unwrap();
+                    // Fill the buffer with audio samples from the source.
+                    for frame in output.chunks_mut(channels as usize) {
+                        for sample in frame.iter_mut() {
+                            let s = source.next().unwrap_or(0.0); // Use silence in case the
+                                                                  // source has finished.
+                            *sample = s * norm_factor * volume;
+                        }
+                    }
+                },
+                |err| log::error!("an error occurred on stream: {}", err),
+            )?
         };
-
-        // Move the source into the config's data callback.  Callback will get cloned
-        // for each device we create.
-        config.set_data_callback(move |_device, output, _frames| {
-            let mut source = source.lock().expect("Failed to acquire audio source lock");
-            // Get the audio normalization factor.
-            let norm_factor = source.normalization_factor().unwrap_or(1.0);
-            // Fill the buffer with audio samples from the source.
-            for sample in output.as_samples_mut() {
-                let s = source.next().unwrap_or(0.0); // Use silence in case the
-                                                      // source has finished.
-                *sample = s * norm_factor;
-            }
-        });
-
-        let device = {
-            let context = self.context.clone();
-            Device::new(Some(context), &config)?
-        };
-
+        if let Err(err) = stream.play() {
+            log::error!("failed to start stream: {}", err);
+        }
         for event in self.event_receiver.iter() {
             match event {
                 InternalEvent::Close => {
                     log::debug!("closing audio output");
-                    if device.is_started() {
-                        if let Err(err) = device.stop() {
-                            log::error!("failed to stop device: {}", err);
-                        }
-                    }
                     break;
                 }
                 InternalEvent::Pause => {
                     log::debug!("pausing audio output");
-                    if device.is_started() {
-                        if let Err(err) = device.stop() {
-                            log::error!("failed to stop device: {}", err);
-                        }
+                    if let Err(err) = stream.pause() {
+                        log::error!("failed to stop device: {}", err);
                     }
                 }
                 InternalEvent::Resume => {
                     log::debug!("resuming audio output");
-                    if !device.is_started() {
-                        if let Err(err) = device.start() {
-                            log::error!("failed to start device: {}", err);
-                        }
+                    if let Err(err) = stream.play() {
+                        log::error!("failed to start device: {}", err);
                     }
                 }
-                InternalEvent::SetVolume(volume) => {
+                InternalEvent::SetVolume(vol) => {
                     log::debug!("volume has changed");
-                    if let Err(err) = device.set_master_volume(volume as f32) {
-                        log::error!("failed to set volume: {}", err);
-                    }
+                    *volume.lock().unwrap() = vol as f32;
                 }
             }
         }
@@ -149,8 +156,25 @@ enum InternalEvent {
     SetVolume(f64),
 }
 
-impl From<miniaudio::Error> for Error {
-    fn from(err: miniaudio::Error) -> Error {
+#[derive(Debug, Clone)]
+struct CPalError(String);
+
+impl std::fmt::Display for CPalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cpal error: {}", self.0)
+    }
+}
+
+impl std::error::Error for CPalError {}
+
+impl From<cpal::DefaultStreamConfigError> for Error {
+    fn from(err: cpal::DefaultStreamConfigError) -> Error {
+        Error::AudioOutputError(Box::new(err))
+    }
+}
+
+impl From<cpal::BuildStreamError> for Error {
+    fn from(err: cpal::BuildStreamError) -> Error {
         Error::AudioOutputError(Box::new(err))
     }
 }
