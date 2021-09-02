@@ -98,11 +98,12 @@ impl AudioOutput {
         let stream = {
             let volume = volume.clone();
             let source = source.clone();
+            // try to build a stream with the config values from the audio source
+            // this may fail, especially on windows
             self.device.build_output_stream(
                 &config,
                 move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut source = source.lock().expect("Failed to acquire audio source lock");
-                    // Get the audio normalization factor.
                     let norm_factor = source.normalization_factor().unwrap_or(1.0);
                     let volume = *volume.lock().unwrap();
                     // Fill the buffer with audio samples from the source.
@@ -118,6 +119,9 @@ impl AudioOutput {
 
         let stream = match stream {
             Ok(stream) => stream,
+            // If building the stream failed using the config values from the audio source,
+            // try to build a new stream using the default config, which hopefully works,
+            // and convert the audio source to match said config.
             Err(err) => {
                 log::info!(
                     "Audio device can't play requested format ({}), performing conversion.",
@@ -128,22 +132,22 @@ impl AudioOutput {
                 // TODO: make this a macro
                 match (config.sample_format(), config.channels()) {
                     (SampleFormat::F32, 1) => {
-                        self.build_stream::<T, f32, 1>(source, config, volume)?
+                        self.build_stream_with_conversion::<T, f32, 1>(source, config, volume)?
                     }
                     (SampleFormat::F32, _) => {
-                        self.build_stream::<T, f32, 2>(source, config, volume)?
+                        self.build_stream_with_conversion::<T, f32, 2>(source, config, volume)?
                     }
                     (SampleFormat::U16, 1) => {
-                        self.build_stream::<T, u16, 1>(source, config, volume)?
+                        self.build_stream_with_conversion::<T, u16, 1>(source, config, volume)?
                     }
                     (SampleFormat::U16, _) => {
-                        self.build_stream::<T, u16, 2>(source, config, volume)?
+                        self.build_stream_with_conversion::<T, u16, 2>(source, config, volume)?
                     }
                     (SampleFormat::I16, 1) => {
-                        self.build_stream::<T, i16, 1>(source, config, volume)?
+                        self.build_stream_with_conversion::<T, i16, 1>(source, config, volume)?
                     }
                     (SampleFormat::I16, _) => {
-                        self.build_stream::<T, i16, 2>(source, config, volume)?
+                        self.build_stream_with_conversion::<T, i16, 2>(source, config, volume)?
                     }
                 }
             }
@@ -177,7 +181,8 @@ impl AudioOutput {
         Ok(())
     }
 
-    fn build_stream<T, F, const C: usize>(
+    // F is the sample format and C the number of channels to use for the cpal audio sink.
+    fn build_stream_with_conversion<T, F, const C: usize>(
         &self,
         source: Arc<Mutex<T>>,
         config: SupportedStreamConfig,
@@ -190,9 +195,16 @@ impl AudioOutput {
     {
         let default_sample_rate = config.sample_rate();
 
-        let source_sample_rate = source.lock().unwrap().sample_rate();
+        // assumed to be constant
+        let source_sample_rate = source
+            .lock()
+            .expect("Failed to acquire audio source lock")
+            .sample_rate();
 
+        // create a signal that dasp can handle
         let source_signal = signal::from_interleaved_samples_iter::<_, [f32; C]>(
+            // iterate over chunks of frames from the audio source and buffer them to prevent
+            // excessive calls of lock
             std::iter::from_fn(move || {
                 let mut source = source.lock().expect("Failed to acquire audio source lock");
                 let channels_source = source.channels();
@@ -200,23 +212,34 @@ impl AudioOutput {
                 let volume = *volume.lock().unwrap();
                 let mut buf = Vec::new();
                 const N: usize = 1024;
+
+                // Try to read N audio frames at a time from source.
                 buf.reserve(N * C);
                 for _ in 0..N {
                     for c in 0..C {
+                        // make sure to only copy samples from channels that actually exist in
+                        // source
                         if c < channels_source as usize {
                             if let Some(s) = source.next() {
                                 buf.push(s * norm_factor * volume)
                             } else {
+                                // this assumes that the source always contains whole frames
                                 break;
                             }
                         } else {
+                            // if the source has less channels than the audio sink, send silence to
+                            // the additional channels
                             buf.push(0.0f32)
                         }
                     }
+                    // if the source has more channels than the audio sink, drop all additional
+                    // samples, so we do not get out of sync
                     for _ in C..channels_source as usize {
                         source.next();
                     }
                 }
+                // no samples -> send some silence, just enough to prevent this loop from getting
+                // too hot
                 if buf.is_empty() {
                     for _ in 0..N * C {
                         buf.push(0.0f32);
@@ -224,8 +247,12 @@ impl AudioOutput {
                 }
                 Some(buf)
             })
+            // actually we only want single samples, so flatten the iterator of buffers containing
+            // frames back to an iterator over samples.
             .flatten(),
         );
+        // linear interpolations as this is fast, Sinc for example had my CPU at >40%, which is
+        // inacceptable
         let interp = Linear::new([0.0f32; C], [0.0f32; C]);
         let mut resampled_signal = source_signal
             .from_hz_to_hz(
@@ -234,13 +261,16 @@ impl AudioOutput {
                 default_sample_rate.0 as f64,
             )
             .until_exhausted()
+            // flatten the iterator over frames to samples
             .flatten()
+            // make sure we have the correct sample format
             .map(f32::to_sample::<F>);
 
         Ok(self.device.build_output_stream(
             &config.into(),
             move |output: &mut [F], _: &cpal::OutputCallbackInfo| {
                 for sample in output.iter_mut() {
+                    // calling unwrap is fine as source_signal is constructed to never end
                     let s = resampled_signal.next().unwrap();
                     *sample = s;
                 }
