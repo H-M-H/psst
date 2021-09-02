@@ -1,7 +1,11 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use miniaudio::{Context, Device, DeviceConfig, DeviceType, Format};
+use rodio::{
+    source::{SineWave, Source},
+    OutputStream, Sink,
+};
 
 use crate::error::Error;
 
@@ -11,6 +15,88 @@ pub trait AudioSource: Iterator<Item = AudioSample> {
     fn channels(&self) -> u8;
     fn sample_rate(&self) -> u32;
     fn normalization_factor(&self) -> Option<f32>;
+}
+
+/// Wrapper for AudioSource that buffers the provided audio to prevent execessive calls to lock of
+/// the Mutex AudioSource is wrapped into.
+struct AudioSourceBuffered<T: AudioSource> {
+    source: Arc<Mutex<T>>,
+    itr: std::vec::IntoIter<f32>,
+}
+
+impl<T: AudioSource> AudioSourceBuffered<T> {
+    fn new(source: Arc<Mutex<T>>) -> Self {
+        Self {
+            source,
+            itr: vec![].into_iter(),
+        }
+    }
+}
+
+impl<T: AudioSource> Iterator for AudioSourceBuffered<T> {
+    type Item = f32;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.itr.next() {
+            // if there is something inside the buffer use that
+            s @ Some(_) => s,
+            // otherwise refill the buffer
+            None => {
+                let mut source = self
+                    .source
+                    .lock()
+                    .expect("Failed to acquire audio source lock");
+                const N: usize = 2048;
+                let mut buf = Vec::new();
+                let channels = source.channels() as usize;
+                let norm_factor = source.normalization_factor().unwrap_or(1.0);
+                // Take N frames out of source and buffer them.
+                buf.reserve(N * channels);
+                for _ in 0..N * channels {
+                    if let Some(s) = source.next() {
+                        buf.push(s * norm_factor);
+                    } else {
+                        break;
+                    }
+                }
+                // If source is empty, add some silence.
+                if buf.is_empty() {
+                    for _ in 0..N * channels {
+                        buf.push(0.0f32);
+                    }
+                }
+                self.itr = buf.into_iter();
+                self.itr.next()
+            }
+        }
+    }
+}
+
+impl<T: AudioSource> Source for AudioSourceBuffered<T> {
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.source
+            .lock()
+            .expect("Failed to acquire audio source lock")
+            .sample_rate()
+    }
+
+    fn channels(&self) -> u16 {
+        self.source
+            .lock()
+            .expect("Failed to acquire audio source lock")
+            .channels() as u16
+    }
+
+    fn current_frame_len(&self) -> Option<usize> {
+        if self.itr.len() > 0 {
+            Some(self.itr.len())
+        } else {
+            None
+        }
+    }
 }
 
 pub struct AudioOutputRemote {
@@ -40,22 +126,16 @@ impl AudioOutputRemote {
 }
 
 pub struct AudioOutput {
-    context: Context,
     event_sender: Sender<InternalEvent>,
     event_receiver: Receiver<InternalEvent>,
 }
 
 impl AudioOutput {
     pub fn open() -> Result<Self, Error> {
-        let backends = &[]; // Use default backend order.
-        let config = None; // Use default context config.
-        let context = Context::new(backends, config)?;
-
         // Channel used for controlling the audio output.
         let (event_sender, event_receiver) = unbounded();
 
         Ok(Self {
-            context,
             event_sender,
             event_receiver,
         })
@@ -71,69 +151,28 @@ impl AudioOutput {
     where
         T: AudioSource + Send + 'static,
     {
-        // Create a device config that describes the kind of device we want to use.
-        let mut config = DeviceConfig::new(DeviceType::Playback);
-
-        {
-            // Setup the device config for playback with the channel count and sample rate
-            // from the audio source.
-            let source = source.lock().expect("Failed to acquire audio source lock");
-            config.playback_mut().set_format(Format::F32);
-            config.playback_mut().set_channels(source.channels().into());
-            config.set_sample_rate(source.sample_rate());
-        };
-
-        // Move the source into the config's data callback.  Callback will get cloned
-        // for each device we create.
-        config.set_data_callback(move |_device, output, _frames| {
-            let mut source = source.lock().expect("Failed to acquire audio source lock");
-            // Get the audio normalization factor.
-            let norm_factor = source.normalization_factor().unwrap_or(1.0);
-            // Fill the buffer with audio samples from the source.
-            for sample in output.as_samples_mut() {
-                let s = source.next().unwrap_or(0.0); // Use silence in case the
-                                                      // source has finished.
-                *sample = s * norm_factor;
-            }
-        });
-
-        let device = {
-            let context = self.context.clone();
-            Device::new(Some(context), &config)?
-        };
+        let (_stream, stream_handle) = OutputStream::try_default()?;
+        let sink = Sink::try_new(&stream_handle)?;
+        sink.append(AudioSourceBuffered::new(source));
 
         for event in self.event_receiver.iter() {
             match event {
                 InternalEvent::Close => {
                     log::debug!("closing audio output");
-                    if device.is_started() {
-                        if let Err(err) = device.stop() {
-                            log::error!("failed to stop device: {}", err);
-                        }
-                    }
+                    sink.stop();
                     break;
                 }
                 InternalEvent::Pause => {
                     log::debug!("pausing audio output");
-                    if device.is_started() {
-                        if let Err(err) = device.stop() {
-                            log::error!("failed to stop device: {}", err);
-                        }
-                    }
+                    sink.pause();
                 }
                 InternalEvent::Resume => {
                     log::debug!("resuming audio output");
-                    if !device.is_started() {
-                        if let Err(err) = device.start() {
-                            log::error!("failed to start device: {}", err);
-                        }
-                    }
+                    sink.play();
                 }
                 InternalEvent::SetVolume(volume) => {
                     log::debug!("volume has changed");
-                    if let Err(err) = device.set_master_volume(volume as f32) {
-                        log::error!("failed to set volume: {}", err);
-                    }
+                    sink.set_volume(volume as f32);
                 }
             }
         }
@@ -149,8 +188,14 @@ enum InternalEvent {
     SetVolume(f64),
 }
 
-impl From<miniaudio::Error> for Error {
-    fn from(err: miniaudio::Error) -> Error {
+impl From<rodio::StreamError> for Error {
+    fn from(err: rodio::StreamError) -> Error {
+        Error::AudioOutputError(Box::new(err))
+    }
+}
+
+impl From<rodio::PlayError> for Error {
+    fn from(err: rodio::PlayError) -> Error {
         Error::AudioOutputError(Box::new(err))
     }
 }
