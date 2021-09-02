@@ -13,6 +13,7 @@ crossbeam-channel = "0.5"
 hmac = "0.11"
 log = "0.4"
 cpal = "0.13.4"
+dasp = { version = "0.11", features = ["interpolate", "interpolate-linear", "signal"] }
 minivorbis = { path = "../minivorbis"}
 num-bigint = { version = "0.4", features = ["rand"] }
 num-traits = "0.2"

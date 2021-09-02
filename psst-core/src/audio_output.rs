@@ -1,10 +1,11 @@
 use std::sync::{Arc, Mutex};
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, SampleRate, StreamConfig,
+    Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig,
 };
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use dasp::{interpolate::linear::Linear, sample::FromSample, signal, Frame, Sample, Signal};
 
 use crate::error::Error;
 
@@ -85,19 +86,18 @@ impl AudioOutput {
             // Setup the device config for playback with the channel count and sample rate
             // from the audio source.
             let source = source.lock().expect("Failed to acquire audio source lock");
-            let default_config: StreamConfig = self.device.default_output_config()?.into();
             config = StreamConfig {
                 channels: source.channels().into(),
                 sample_rate: SampleRate(source.sample_rate()),
-                buffer_size: default_config.buffer_size,
+                buffer_size: cpal::BufferSize::Default,
             };
         }
 
         let volume = Arc::new(Mutex::new(1.0f32));
-        let channels = config.channels;
         // Move the source and a clone of the volume into the data callback.
         let stream = {
             let volume = volume.clone();
+            let source = source.clone();
             self.device.build_output_stream(
                 &config,
                 move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -106,20 +106,49 @@ impl AudioOutput {
                     let norm_factor = source.normalization_factor().unwrap_or(1.0);
                     let volume = *volume.lock().unwrap();
                     // Fill the buffer with audio samples from the source.
-                    for frame in output.chunks_mut(channels as usize) {
-                        for sample in frame.iter_mut() {
-                            let s = source.next().unwrap_or(0.0); // Use silence in case the
-                                                                  // source has finished.
-                            *sample = s * norm_factor * volume;
-                        }
+                    for sample in output.iter_mut() {
+                        let s = source.next().unwrap_or(0.0); // Use silence in case the
+                                                              // source has finished.
+                        *sample = s * norm_factor * volume;
                     }
                 },
                 |err| log::error!("an error occurred on stream: {}", err),
-            )?
+            )
         };
-        if let Err(err) = stream.play() {
-            log::error!("failed to start stream: {}", err);
-        }
+
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(err) => {
+                log::info!(
+                    "Audio device can't play requested format ({}), performing conversion.",
+                    err,
+                );
+                let config = self.device.default_output_config()?;
+                let volume = volume.clone();
+                // TODO: make this a macro
+                match (config.sample_format(), config.channels()) {
+                    (SampleFormat::F32, 1) => {
+                        self.build_stream::<T, f32, 1>(source, config, volume)?
+                    }
+                    (SampleFormat::F32, _) => {
+                        self.build_stream::<T, f32, 2>(source, config, volume)?
+                    }
+                    (SampleFormat::U16, 1) => {
+                        self.build_stream::<T, u16, 1>(source, config, volume)?
+                    }
+                    (SampleFormat::U16, _) => {
+                        self.build_stream::<T, u16, 2>(source, config, volume)?
+                    }
+                    (SampleFormat::I16, 1) => {
+                        self.build_stream::<T, i16, 1>(source, config, volume)?
+                    }
+                    (SampleFormat::I16, _) => {
+                        self.build_stream::<T, i16, 2>(source, config, volume)?
+                    }
+                }
+            }
+        };
+
         for event in self.event_receiver.iter() {
             match event {
                 InternalEvent::Close => {
@@ -146,6 +175,78 @@ impl AudioOutput {
         }
 
         Ok(())
+    }
+
+    fn build_stream<T, F, const C: usize>(
+        &self,
+        source: Arc<Mutex<T>>,
+        config: SupportedStreamConfig,
+        volume: Arc<Mutex<f32>>,
+    ) -> Result<Stream, Error>
+    where
+        T: AudioSource + Send + 'static,
+        F: Sample + FromSample<f32> + cpal::Sample + 'static,
+        [f32; C]: Frame<Sample = f32>,
+    {
+        let default_sample_rate = config.sample_rate();
+
+        let source_sample_rate = source.lock().unwrap().sample_rate();
+
+        let source_signal = signal::from_interleaved_samples_iter::<_, [f32; C]>(
+            std::iter::from_fn(move || {
+                let mut source = source.lock().expect("Failed to acquire audio source lock");
+                let channels_source = source.channels();
+                let norm_factor = source.normalization_factor().unwrap_or(1.0);
+                let volume = *volume.lock().unwrap();
+                let mut buf = Vec::new();
+                const N: usize = 1024;
+                buf.reserve(N * C);
+                for _ in 0..N {
+                    for c in 0..C {
+                        if c < channels_source as usize {
+                            if let Some(s) = source.next() {
+                                buf.push(s * norm_factor * volume)
+                            } else {
+                                break;
+                            }
+                        } else {
+                            buf.push(0.0f32)
+                        }
+                    }
+                    for _ in C..channels_source as usize {
+                        source.next();
+                    }
+                }
+                if buf.is_empty() {
+                    for _ in 0..N * C {
+                        buf.push(0.0f32);
+                    }
+                }
+                Some(buf)
+            })
+            .flatten(),
+        );
+        let interp = Linear::new([0.0f32; C], [0.0f32; C]);
+        let mut resampled_signal = source_signal
+            .from_hz_to_hz(
+                interp,
+                source_sample_rate as f64,
+                default_sample_rate.0 as f64,
+            )
+            .until_exhausted()
+            .flatten()
+            .map(f32::to_sample::<F>);
+
+        Ok(self.device.build_output_stream(
+            &config.into(),
+            move |output: &mut [F], _: &cpal::OutputCallbackInfo| {
+                for sample in output.iter_mut() {
+                    let s = resampled_signal.next().unwrap();
+                    *sample = s;
+                }
+            },
+            |err| log::error!("an error occurred on stream: {}", err),
+        )?)
     }
 }
 
